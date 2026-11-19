@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use glam::{Affine3A, Quat, Vec3, Vec3A, vec3a};
 use ovr_overlay::{
     chaperone_setup::ChaperoneSetupManager,
@@ -20,11 +22,21 @@ struct MoverData<T> {
     hand_pose: T,
 }
 
+// How often to check whether SteamVR or its driver replaced the zero pose while nothing is being moved
+const OFFSET_CHECK_INTERVAL: Duration = Duration::from_millis(500);
+
 pub(super) struct PlayspaceMover {
     universe: ETrackingUniverseOrigin,
     drag: Option<MoverData<Vec3A>>,
     rotate: Option<MoverData<Quat>>,
     playspace_state: PlayspaceState,
+    // The zero pose SteamVR set before WayVR moved the space, and the one WayVR committed on top of it.
+    // Inside-out drivers rewrite the zero pose, for example when tracking relocalizes; the offset between
+    // these two is then applied again to the new pose.
+    external_pose: Option<Affine3A>,
+    committed_pose: Option<Affine3A>,
+    committed_bounds: Vec<[f32; 3]>,
+    next_offset_check: Instant,
 }
 
 impl PlayspaceMover {
@@ -34,6 +46,10 @@ impl PlayspaceMover {
             drag: None,
             rotate: None,
             playspace_state: load_playspace_state().unwrap_or_default(),
+            external_pose: None,
+            committed_pose: None,
+            committed_bounds: Vec::new(),
+            next_offset_check: Instant::now(),
         }
     }
 
@@ -72,6 +88,15 @@ impl PlayspaceMover {
     ) {
         let universe = self.universe.clone();
 
+        if self.committed_pose.is_some()
+            && self.drag.is_none()
+            && self.rotate.is_none()
+            && Instant::now() >= self.next_offset_check
+        {
+            self.next_offset_check = Instant::now() + OFFSET_CHECK_INTERVAL;
+            self.current_pose(chaperone_mgr);
+        }
+
         if let Some(data) = self.rotate.as_mut() {
             let pointer = &app.input_state.pointers[data.hand];
             if !pointer.now.space_rotate {
@@ -107,10 +132,12 @@ impl PlayspaceMover {
             }
             set_working_copy(&universe, chaperone_mgr, &data.pose);
             chaperone_mgr.commit_working_copy(EChaperoneConfigFile::EChaperoneConfigFile_Live);
+            let after = data.pose;
+            self.note_commit(before_pose, after, chaperone_mgr);
         } else {
             for (i, pointer) in app.input_state.pointers.iter().enumerate() {
                 if pointer.now.space_rotate {
-                    let Some(mat) = get_working_copy(&universe, chaperone_mgr) else {
+                    let Some(mat) = self.current_pose(chaperone_mgr) else {
                         log::warn!("Can't space rotate - failed to get zero pose");
                         return;
                     };
@@ -163,10 +190,12 @@ impl PlayspaceMover {
             }
             set_working_copy(&universe, chaperone_mgr, &data.pose);
             chaperone_mgr.commit_working_copy(EChaperoneConfigFile::EChaperoneConfigFile_Live);
+            let after = data.pose;
+            self.note_commit(before_pose, after, chaperone_mgr);
         } else {
             for (i, pointer) in app.input_state.pointers.iter().enumerate() {
                 if pointer.now.space_drag {
-                    let Some(mat) = get_working_copy(&universe, chaperone_mgr) else {
+                    let Some(mat) = self.current_pose(chaperone_mgr) else {
                         log::warn!("Can't space drag - failed to get zero pose");
                         return;
                     };
@@ -210,6 +239,7 @@ impl PlayspaceMover {
 
         set_working_copy(&self.universe, chaperone_mgr, &xform);
         chaperone_mgr.commit_working_copy(EChaperoneConfigFile::EChaperoneConfigFile_Live);
+        self.forget_offset();
 
         if !app.session.config.space_drag_affects_world {
             playspace_common::shift_world(overlays, &mut app.anchor, &before, &xform);
@@ -235,7 +265,7 @@ impl PlayspaceMover {
         let anchor = &mut app.anchor;
         let y1 = input.pointers[0].pose.translation.y;
         let y2 = input.pointers[1].pose.translation.y;
-        let Some(mut mat) = get_working_copy(&self.universe, chaperone_mgr) else {
+        let Some(mut mat) = self.current_pose(chaperone_mgr) else {
             log::warn!("Can't fix floor - failed to get zero pose");
             return;
         };
@@ -246,6 +276,7 @@ impl PlayspaceMover {
 
         set_working_copy(&self.universe, chaperone_mgr, &mat);
         chaperone_mgr.commit_working_copy(EChaperoneConfigFile::EChaperoneConfigFile_Live);
+        self.note_commit(before, mat, chaperone_mgr);
 
         if !app.session.config.space_drag_affects_world {
             playspace_common::shift_world(overlays, anchor, &before, &mat);
@@ -279,7 +310,7 @@ impl PlayspaceMover {
         let input = &app.input_state;
         let anchor = &mut app.anchor;
 
-        let Some(mat) = get_working_copy(&self.universe, chaperone_mgr) else {
+        let Some(mat) = self.current_pose(chaperone_mgr) else {
             log::warn!("Can't recenter - failed to get zero pose");
             return;
         };
@@ -319,6 +350,7 @@ impl PlayspaceMover {
 
         set_working_copy(&self.universe, chaperone_mgr, &new_mat);
         chaperone_mgr.commit_working_copy(EChaperoneConfigFile::EChaperoneConfigFile_Live);
+        self.note_commit(before, new_mat, chaperone_mgr);
 
         if !app.session.config.space_drag_affects_world {
             playspace_common::shift_world(overlays, anchor, &before, &new_mat);
@@ -328,7 +360,7 @@ impl PlayspaceMover {
     pub fn playspace_changed(
         &mut self,
         compositor_mgr: &mut CompositorManager,
-        _chaperone_mgr: &mut ChaperoneSetupManager,
+        chaperone_mgr: &mut ChaperoneSetupManager,
     ) {
         let new_universe = compositor_mgr.get_tracking_space();
         if new_universe != self.universe {
@@ -338,7 +370,58 @@ impl PlayspaceMover {
                 universe_str(&new_universe)
             );
             self.universe = new_universe;
+            self.forget_offset();
+        } else if self.committed_pose.is_some() && self.drag.is_none() && self.rotate.is_none() {
+            // A drag in progress re-applies the offset when it starts again
+            self.current_pose(chaperone_mgr);
         }
+    }
+
+    /// The current zero pose. If SteamVR or its driver replaced the pose WayVR committed, WayVR's offset is
+    /// applied again on top of the new one first.
+    fn current_pose(&mut self, chaperone_mgr: &mut ChaperoneSetupManager) -> Option<Affine3A> {
+        let live = get_working_copy(&self.universe, chaperone_mgr)?;
+        let (Some(external), Some(committed)) = (self.external_pose, self.committed_pose) else {
+            return Some(live);
+        };
+        if poses_match(&live, &committed) {
+            return Some(live);
+        }
+
+        let offset = external.inverse() * committed;
+        let restored = live * offset;
+        // Bounds that still match WayVR's were left alone and are already moved
+        if self.universe == ETrackingUniverseOrigin::TrackingUniverseStanding
+            && !bounds_match(&bounds_points(chaperone_mgr), &self.committed_bounds)
+        {
+            apply_chaperone_transform(offset.inverse(), chaperone_mgr);
+        }
+        set_working_copy(&self.universe, chaperone_mgr, &restored);
+        chaperone_mgr.commit_working_copy(EChaperoneConfigFile::EChaperoneConfigFile_Live);
+        log::info!("Zero pose was replaced externally, applied the space offset again");
+
+        self.external_pose = None;
+        self.note_commit(live, restored, chaperone_mgr);
+        Some(restored)
+    }
+
+    fn note_commit(
+        &mut self,
+        before: Affine3A,
+        after: Affine3A,
+        chaperone_mgr: &mut ChaperoneSetupManager,
+    ) {
+        self.external_pose.get_or_insert(before);
+        self.committed_pose = Some(after);
+        if self.universe == ETrackingUniverseOrigin::TrackingUniverseStanding {
+            self.committed_bounds = bounds_points(chaperone_mgr);
+        }
+    }
+
+    fn forget_offset(&mut self) {
+        self.external_pose = None;
+        self.committed_pose = None;
+        self.committed_bounds.clear();
     }
 
     pub fn get_universe(&self) -> ETrackingUniverseOrigin {
@@ -423,4 +506,27 @@ fn apply_chaperone_transform(transform: Affine3A, chaperone_mgr: &mut ChaperoneS
         });
     }
     chaperone_mgr.set_working_collision_bounds_info(quads.as_mut_slice());
+}
+
+fn poses_match(a: &Affine3A, b: &Affine3A) -> bool {
+    a.to_cols_array()
+        .iter()
+        .zip(b.to_cols_array())
+        .all(|(x, y)| (x - y).abs() < 1e-4)
+}
+
+fn bounds_match(a: &[[f32; 3]], b: &[[f32; 3]]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .flatten()
+            .zip(b.iter().flatten())
+            .all(|(x, y)| (x - y).abs() < 1e-4)
+}
+
+fn bounds_points(chaperone_mgr: &mut ChaperoneSetupManager) -> Vec<[f32; 3]> {
+    chaperone_mgr
+        .get_live_collision_bounds_info()
+        .iter()
+        .flat_map(|quad| quad.vCorners.iter().map(|corner| corner.v))
+        .collect()
 }
