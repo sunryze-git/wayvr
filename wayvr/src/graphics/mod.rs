@@ -207,4 +207,13 @@ impl GpuFutures {
     pub fn wait(mut self) -> anyhow::Result<()> {
         GpuSubmission::wait_all(&mut self.submissions)
     }
+
+    pub fn is_complete(&mut self) -> anyhow::Result<bool> {
+        for submission in &mut self.submissions {
+            if !submission.is_complete()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }

@@ -192,7 +192,9 @@ impl LinePool {
         for line in self.lines.values_mut() {
             line.swapchain.ensure_image_released()?;
 
-            if let Some(inner) = line.maybe_line.take() {
+            if let Some(inner) = line.maybe_line.take()
+                && line.swapchain.ever_acquired
+            {
                 let quad = xr::CompositionLayerQuad::new()
                     .pose(inner.pose)
                     .sub_image(line.swapchain.get_subimage(0))

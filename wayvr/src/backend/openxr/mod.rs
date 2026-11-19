@@ -174,6 +174,7 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
     let mut environment_blend_mode = modes[0];
     let mut last_frame_time = Instant::now();
     let mut retired_swapchains = SwapchainRetirementQueue::new(app.gfx_extras.gfx_pool.clone());
+    let mut pending_render: Option<GpuFutures> = None;
 
     // declared here so rust drops this before all long-lived XR objects
     let _gpu_idle_before_xr_drop = OpenXrGpuIdleGuard(app.gfx.clone());
@@ -416,58 +417,78 @@ pub fn openxr_run(args: &Args, params: RunParams) -> Result<(), BackendError> {
         }
 
         // Begin rendering
-        let mut futures = GpuFutures::default();
+        let render_ready = match pending_render.as_mut() {
+            Some(pending) => pending.is_complete()?,
+            None => true,
+        };
+        if render_ready {
+            drop(pending_render.take());
+            let mut futures = GpuFutures::default();
 
-        if !main_session_visible && let Some(skybox) = skybox.as_mut() {
-            skybox.render(&xr_state, &app, &mut futures)?;
+            if !main_session_visible && let Some(skybox) = skybox.as_mut() {
+                skybox.render(&xr_state, &app, &mut futures)?;
+            }
+
+            for o in overlays.values_mut() {
+                o.data.cur_visible = false;
+                if o.config
+                    .active_state
+                    .as_ref()
+                    .is_none_or(|s| s.alpha < 0.01)
+                {
+                    log::trace!("{}: hidden, skip render", o.config.name);
+                    continue;
+                }
+
+                if !o.data.init {
+                    log::trace!("{}: init", o.config.name);
+                    o.init(&mut app)?;
+                    o.data.init = true;
+                }
+
+                let should_render = matches!(o.should_render(&mut app)?, ShouldRender::Should);
+                log::trace!("{}: should_render returned: {should_render}", o.config.name);
+
+                if should_render {
+                    log::trace!("{}: render new frame", o.config.name);
+                    let meta = o.config.backend.frame_meta().unwrap(); // want panic
+                    let stereo = !matches!(meta.stereo, StereoMode::None);
+                    let wsi = o.ensure_swapchain_acquire(
+                        &app,
+                        &xr_state,
+                        &mut retired_swapchains,
+                        meta.extent,
+                        stereo,
+                    )?;
+                    let tgt = RenderTarget { views: wsi.views };
+                    let mut rdr = RenderResources::new(&app.gfx_extras.gfx_pool, tgt, &meta)?;
+                    o.render(&mut app, &mut rdr)?;
+                    futures.add(rdr.end()?);
+                } else if o.data.swapchain.is_none() {
+                    log::trace!("{}: not showing due to missing swapchain", o.config.name);
+                    continue;
+                } else {
+                    log::trace!("{}: showing stale frame", o.config.name);
+                }
+                o.data.cur_visible = true;
+            }
+
+            lines.render(&app, &mut futures)?;
+            // OpenXR synchronizes work submitted on its bound Vulkan queue. Retain
+            // resources and avoid rewriting them until this submission completes.
+            pending_render = Some(futures);
+        } else {
+            // Update input and composition poses at the headset refresh rate
+            // while the GPU finishes the last panel redraw.
+            for o in overlays.values_mut() {
+                o.data.cur_visible = o
+                    .config
+                    .active_state
+                    .as_ref()
+                    .is_some_and(|s| s.alpha >= 0.01)
+                    && o.data.swapchain.as_ref().is_some_and(|s| s.ever_acquired);
+            }
         }
-
-        for o in overlays.values_mut() {
-            o.data.cur_visible = false;
-            if o.config
-                .active_state
-                .as_ref()
-                .is_none_or(|s| s.alpha < 0.01)
-            {
-                log::trace!("{}: hidden, skip render", o.config.name);
-                continue;
-            }
-
-            if !o.data.init {
-                log::trace!("{}: init", o.config.name);
-                o.init(&mut app)?;
-                o.data.init = true;
-            }
-
-            let should_render = matches!(o.should_render(&mut app)?, ShouldRender::Should);
-            log::trace!("{}: should_render returned: {should_render}", o.config.name);
-
-            if should_render {
-                log::trace!("{}: render new frame", o.config.name);
-                let meta = o.config.backend.frame_meta().unwrap(); // want panic
-                let stereo = !matches!(meta.stereo, StereoMode::None);
-                let wsi = o.ensure_swapchain_acquire(
-                    &app,
-                    &xr_state,
-                    &mut retired_swapchains,
-                    meta.extent,
-                    stereo,
-                )?;
-                let tgt = RenderTarget { views: wsi.views };
-                let mut rdr = RenderResources::new(&app.gfx_extras.gfx_pool, tgt, &meta)?;
-                o.render(&mut app, &mut rdr)?;
-                futures.add(rdr.end()?);
-            } else if o.data.swapchain.is_none() {
-                log::trace!("{}: not showing due to missing swapchain", o.config.name);
-                continue;
-            } else {
-                log::trace!("{}: showing stale frame", o.config.name);
-            }
-            o.data.cur_visible = true;
-        }
-
-        lines.render(&app, &mut futures)?;
-        futures.wait()?;
         // End rendering
 
         if let Some(monado_state) = &mut app.monado_state {

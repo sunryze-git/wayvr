@@ -2817,6 +2817,14 @@ pub(super) struct RawSubmission {
 }
 
 impl RawSubmission {
+	pub(super) fn is_complete(&mut self) -> anyhow::Result<bool> {
+		if !self.completed {
+			self.completed = unsafe { self.context.device.get_fence_status(self.fence) }
+				.map_err(|e| anyhow!("vkGetFenceStatus failed: {e:?}"))?;
+		}
+		Ok(self.completed)
+	}
+
 	pub(super) fn wait_all(submissions: &mut [&mut Self]) -> anyhow::Result<()> {
 		let Some(first) = submissions.first() else {
 			return Ok(());

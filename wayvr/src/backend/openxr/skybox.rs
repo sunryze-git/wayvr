@@ -266,6 +266,11 @@ impl Skybox {
         xr: &'a XrState,
         app: &AppState,
     ) -> anyhow::Result<Vec<CompositionLayer<'a>>> {
+        if self.sky.as_ref().is_none_or(|s| !s.ever_acquired)
+            || self.grid.as_ref().is_none_or(|s| !s.ever_acquired)
+        {
+            return Ok(Vec::new());
+        }
         // cover the entire sphere
         const HORIZ_ANGLE: f32 = 2.0 * PI;
         const HI_VERT_ANGLE: f32 = 0.5 * PI;

@@ -78,6 +78,10 @@ impl GpuSubmission {
 		Self::wait_all(std::slice::from_mut(&mut self))
 	}
 
+	pub fn is_complete(&mut self) -> anyhow::Result<bool> {
+		self.raw.is_complete()
+	}
+
 	pub fn wait_all(submissions: &mut [Self]) -> anyhow::Result<()> {
 		let mut raw = submissions
 			.iter_mut()
